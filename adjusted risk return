@@ -1,0 +1,197 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+# Load the CSV file
+file_path = 'C:/Users/T809650/OneDrive - Santander Office 365/Área de Trabalho/Dados Para Python.csv'
+data = pd.read_csv(file_path, sep=';')
+
+# Display the exact column names to ensure they are parsed correctly
+print(f"Columns in the DataFrame: {list(data.columns)}")
+
+# Strip any leading or trailing whitespace from column names
+data.columns = data.columns.str.strip()
+
+# Check if 'Data' column needs conversion
+if 'Data' in data.columns:
+    if data['Data'].dtype == object:  # If 'Data' is a string
+        data['Data'] = data['Data'].str.replace(',', '').str.strip().astype(int)
+    else:
+        data['Data'] = data['Data'].astype(int)
+    print("Data column processed successfully.")
+else:
+    print("The 'Data' column was not found in the DataFrame.")
+
+# Convert the values to numeric (handling cases where they might be strings with percentages)
+for col in data.columns[1:]:
+    if data[col].dtype == object:  # Only apply string operations if the column is an object
+        data[col] = data[col].str.replace('%', '').astype(float) / 100
+    else:
+        data[col] = data[col].astype(float) / 100
+
+# Initialize the rows list and the all_portfolios list
+rows = []
+all_portfolios = []
+
+# Define the window parameters
+window_size = 756
+step_size = 63
+
+# Function to format weights as percentages
+def format_weights(weights):
+    return [f"{weight * 100:.2f}%" for weight in weights]
+
+# Function to calculate portfolio return and risk based on weights
+def portfolio_metrics(weights, returns, covariance):
+    portfolio_return = np.dot(weights, returns)
+    portfolio_risk = np.sqrt(np.dot(weights.T, np.dot(covariance, weights)))
+    return portfolio_return, portfolio_risk
+
+# Different objective functions for different profiles
+def profile_objective(weights, returns, covariance, profile):
+    portfolio_return, portfolio_risk = portfolio_metrics(weights, returns, covariance)
+    if profile == 'moderado':
+        return -portfolio_return / portfolio_risk  # Sharpe ratio maximization
+    elif profile == 'balanceado':
+        return -portfolio_return + 0.1 * portfolio_risk  # Moderate risk-return balance
+    elif profile == 'arrojado':
+        return -portfolio_return + 0.2 * portfolio_risk  # Higher weight to risk
+    elif profile == 'agressivo':
+        return -portfolio_return + 0.3 * portfolio_risk  # Highest weight to risk
+    else:  # conservador
+        return portfolio_risk  # Risk minimization
+
+# Constraints: Weights must sum to 1 and no asset should have less than 1% allocation
+def allocation_constraints(weights):
+    return weights.sum() - 1
+
+# Function to create profile-specific bounds and set minimum allocations
+def create_profile_bounds(profile):
+    bounds = []
+    for asset in data.columns[1:]:
+        if profile == 'conservador' and asset in ['Ibovespa', 'S&P 500']:
+            bounds.append((0, 0))  # Force allocation to 0% for Ibovespa and S&P 500 in conservador profile
+        else:
+            bounds.append((0.01, 1))  # Minimum allocation of 1%, maximum 100%
+    return tuple(bounds)
+
+# Volatility constraints
+profile_volatility_limits = {
+    'conservador': 0.0127,
+    'moderado': 0.0250,  # Adjusted to be more distinct
+    'balanceado': 0.0370,
+    'arrojado': 0.0500,  # Adjusted to be more distinct
+    'agressivo': 0.0698
+}
+
+# Prepare lists to store results for each window
+window_results = []
+
+# Calculate metrics for each window
+for start in range(0, len(data) - window_size + 1, step_size):
+    end = start + window_size
+    window_data = data.iloc[start:end]
+
+    # Calculate returns for each asset class in this window
+    returns = (window_data.iloc[-1, 1:] / window_data.iloc[0, 1:]) - 1
+
+    # Calculate volatility (standard deviation) for each asset class in this window
+    volatility = window_data.iloc[:, 1:].std()
+
+    # Calculate the covariance matrix for the asset classes in this window
+    covariance = window_data.iloc[:, 1:].cov()
+
+    # Store results for this window
+    window_results.append({
+        'window_start': start,
+        'window_end': end,
+        'returns': returns,
+        'volatility': volatility,
+        'covariance': covariance
+    })
+
+# Store portfolio results
+portfolio_results = []
+
+for result in window_results:
+    window_start = result['window_start']
+    window_end = result['window_end']
+    returns = result['returns'].values
+    covariance = result['covariance']
+
+    window_portfolio_results = []
+
+    for profile, max_volatility in profile_volatility_limits.items():
+        initial_weights = np.ones(len(returns)) / len(returns)
+        bounds = create_profile_bounds(profile)
+        constraints = [{'type': 'eq', 'fun': allocation_constraints},
+                       {'type': 'ineq', 'fun': lambda weights: max_volatility - portfolio_metrics(weights, returns, covariance)[1]}]
+
+        # Optimization using the profile-specific objective function
+        optimized = minimize(profile_objective, initial_weights, args=(returns, covariance, profile),
+                             method='SLSQP', bounds=bounds, constraints=constraints)
+
+        opt_return, opt_risk = portfolio_metrics(optimized.x, returns, covariance.values)
+
+        portfolio_info = {
+            'profile': profile,
+            'opt_return': opt_return,
+            'opt_risk': opt_risk,
+            'weights': optimized.x
+        }
+
+        window_portfolio_results.append(portfolio_info)
+        all_portfolios.append(portfolio_info)
+
+    portfolio_results.append({
+        'window_start': window_start,
+        'window_end': window_end,
+        'portfolios': window_portfolio_results,
+        'covariance': covariance
+    })
+
+    # Append the results for this window to rows
+    rows.append([f"Window Start: {window_start} - Window End: {window_end}"])
+    rows.append(["Covariance Matrix:"])
+    covariance_df = pd.DataFrame(covariance, columns=data.columns[1:], index=data.columns[1:])
+    covariance_str = covariance_df.to_string().split('\n')
+    for line in covariance_str:
+        rows.append([line])
+    
+    for portfolio in window_portfolio_results:
+        rows.append([])  # Blank row before each profile for better readability
+        rows.append([f"Profile: {portfolio['profile'].capitalize()}"])  # Profile name before weights
+        rows.append(["Weights:"])
+        weights = format_weights(portfolio['weights'])
+        rows.extend([[f"{asset}", weight] for asset, weight in zip(data.columns[1:], weights)])
+        rows.append([f"Portfolio Return:", f"{portfolio['opt_return']:.2%}"])
+        rows.append([f"Portfolio Risk:", f"{portfolio['opt_risk']:.2%}"])
+        rows.append([])  # Empty row for spacing
+
+# Sort by highest return and lowest risk
+top_portfolios = sorted(all_portfolios, key=lambda x: (-x['opt_return'], x['opt_risk']))[:5]
+
+# Calculate the average portfolio
+avg_weights = np.mean([p['weights'] for p in all_portfolios], axis=0)
+avg_return = np.mean([p['opt_return'] for p in all_portfolios])
+avg_risk = np.mean([p['opt_risk'] for p in all_portfolios])
+
+# Add the top 5 and average portfolios to the results
+rows.append(["Top 5 Portfolios"])
+for i, portfolio in enumerate(top_portfolios, start=1):
+    rows.append([f"Top Portfolio {i}"])
+    rows.extend([[f"Return:", f"{portfolio['opt_return']:.2%}"],
+                 [f"Risk:", f"{portfolio['opt_risk']:.2%}"]])
+    rows.append(["Weights:"])
+    rows.extend([[f"{asset}", f"{weight * 100:.2f}%"] for asset, weight in zip(data.columns[1:], portfolio['weights'])])
+    rows.append([])
+
+rows.append(["Average Portfolio"])
+rows.extend([[f"Return:", f"{avg_return:.2%}"],
+             [f"Risk:", f"{avg_risk:.2%}"]])
+rows.append(["Weights:"])
+rows.extend([[f"{asset}", f"{weight * 100:.2f}%"] for asset, weight in zip(data.columns[1:], avg_weights)])
+
+# Convert the rows to a DataFrame and save to CSV
+results_df = pd.DataFrame(rows)
+results_df.to_csv('C:/Users/T809650/VS Code/adjusted_risk_return.csv', index=False, header=False)
