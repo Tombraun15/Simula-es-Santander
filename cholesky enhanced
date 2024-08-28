@@ -1,0 +1,188 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from numpy.linalg import cholesky
+
+# Load the CSV file
+file_path = 'C:/Users/T809650/OneDrive - Santander Office 365/Área de Trabalho/Dados Para Python.csv'
+data = pd.read_csv(file_path, sep=';')
+
+# Convert the values to numeric, handling the percentage formatting
+for col in data.columns[1:]:
+    data[col] = data[col].str.replace('%', '').astype(float) / 100
+
+# Check if 'Data' column is of string type and contains commas
+if data['Data'].dtype == object:  # If 'Data' is a string
+    data['Data'] = data['Data'].str.replace(',', '').astype(int)
+else:
+    data['Data'] = data['Data'].astype(int)  # Convert directly to integers if it's already numeric
+
+# Calculate the correlation matrix for the asset classes
+correlation_matrix = data.iloc[:, 1:].corr()
+
+# Perform Cholesky decomposition on the correlation matrix
+cholesky_matrix = cholesky(correlation_matrix)
+
+# Function to simulate correlated returns
+def simulate_returns(cholesky_matrix, num_simulations=10000):
+    uncorrelated_randoms = np.random.normal(size=(num_simulations, cholesky_matrix.shape[0]))
+    correlated_randoms = np.dot(uncorrelated_randoms, cholesky_matrix)
+    return correlated_randoms
+
+# Simulate returns using the Cholesky matrix
+simulated_returns = simulate_returns(cholesky_matrix, num_simulations=10000)
+
+# Define the window parameters
+window_size = 756
+step_size = 63
+
+# Function to format weights as percentages with asset names
+def format_weights_with_assets(weights, asset_names):
+    return [(f"{asset}", f"{weight * 100:.2f}%") for asset, weight in zip(asset_names, weights)]
+
+# Function to calculate portfolio return and risk based on weights
+def portfolio_metrics(weights, returns, covariance):
+    portfolio_return = np.dot(weights, returns)
+    portfolio_risk = np.sqrt(np.dot(weights.T, np.dot(covariance, weights)))
+    return portfolio_return, portfolio_risk
+
+# Function to minimize (negative Sharpe ratio)
+def neg_sharpe_ratio(weights, returns, covariance):
+    portfolio_return, portfolio_risk = portfolio_metrics(weights, returns, covariance)
+    return -portfolio_return / portfolio_risk
+
+# Constraints: Weights must sum to 1 and no asset should have less than 1% allocation
+def allocation_constraints(weights):
+    return weights.sum() - 1
+
+# Function to create profile-specific bounds and set minimum allocations
+def create_profile_bounds(profile):
+    bounds = []
+    for asset in data.columns[1:]:
+        if profile == 'conservador' and asset in ['Ibovespa', 'S&P 500']:
+            bounds.append((0, 0))  # Force allocation to 0% for Ibovespa and S&P 500 in conservador profile
+        else:
+            bounds.append((0.01, 1))  # Minimum allocation of 1%, maximum 100%
+    return tuple(bounds)
+
+# Volatility constraints
+profile_volatility_limits = {
+    'conservador': 0.0127,
+    'moderado': 0.0370,
+    'balanceado': 0.0458,
+    'arrojado': 0.0629,
+    'agressivo': 0.0698
+}
+
+# Initialize the list to store the rows for the final CSV
+rows = []
+
+# Prepare lists to store results for each window
+window_results = []
+
+# Calculate metrics for each window
+for start in range(0, len(data) - window_size + 1, step_size):
+    end = start + window_size
+    window_data = data.iloc[start:end]
+
+    # Calculate returns for each asset class in this window
+    returns = (window_data.iloc[-1, 1:] / window_data.iloc[0, 1:]) - 1
+
+    # Calculate volatility (standard deviation) for each asset class in this window
+    volatility = window_data.iloc[:, 1:].std()
+
+    # Calculate the covariance matrix for the asset classes in this window
+    covariance = window_data.iloc[:, 1:].cov()
+
+    # Add the window start-end information as a header row
+    rows.append([f"Window Start: {start} - Window End: {end}"])
+
+    # Append the covariance matrix as a table under the window information
+    rows.append(["Covariance Matrix:"])
+    rows.append([''] + list(data.columns[1:]))  # Column headers
+    covariance_matrix = covariance.to_numpy()
+    for i, asset in enumerate(data.columns[1:]):
+        rows.append([asset] + covariance_matrix[i].tolist())
+
+    # Add profile-specific results under this header
+    window_portfolio_results = []
+    for profile, max_volatility in profile_volatility_limits.items():
+        # Add a blank row before each profile
+        rows.append([])
+
+        initial_weights = np.ones(len(returns)) / len(returns)
+        bounds = create_profile_bounds(profile)
+        constraints = [{'type': 'eq', 'fun': allocation_constraints},
+                       {'type': 'ineq', 'fun': lambda weights: max_volatility - portfolio_metrics(weights, returns, covariance)[1]}]
+
+        # Optimization
+        optimized = minimize(neg_sharpe_ratio, initial_weights, args=(returns, covariance),
+                             method='SLSQP', bounds=bounds, constraints=constraints)
+
+        opt_return, opt_risk = portfolio_metrics(optimized.x, returns, covariance)
+        formatted_weights = format_weights_with_assets(optimized.x, data.columns[1:])
+
+        # Show profile name, weights, then return and risk
+        rows.append([f'Profile: {profile.capitalize()}'])
+        rows.append([f'{profile.capitalize()} Weights:'])
+        rows.extend([[asset, weight] for asset, weight in formatted_weights])
+        rows.append([f'{profile.capitalize()} Return:', f"{opt_return:.2%}"])
+        rows.append([f'{profile.capitalize()} Risk:', f"{opt_risk:.2%}"])
+
+        window_portfolio_results.append({
+            'profile': profile,
+            'opt_weights': optimized.x,
+            'opt_return': opt_return,
+            'opt_risk': opt_risk,
+        })
+
+    rows.append([])  # Add an empty row for better separation between windows
+    window_results.append(window_portfolio_results)
+
+# Calculate the best and average portfolios
+best_portfolios = {profile: None for profile in profile_volatility_limits.keys()}
+average_portfolios = {profile: {'weights': np.zeros(len(data.columns[1:])), 'returns': 0, 'risk': 0} for profile in profile_volatility_limits.keys()}
+
+for window in window_results:
+    for portfolio in window:
+        profile = portfolio['profile']
+        if not best_portfolios[profile] or portfolio['opt_return'] > best_portfolios[profile]['opt_return']:
+            best_portfolios[profile] = portfolio
+
+        average_portfolios[profile]['weights'] += portfolio['opt_weights']
+        average_portfolios[profile]['returns'] += portfolio['opt_return']
+        average_portfolios[profile]['risk'] += portfolio['opt_risk']
+
+# Normalize the average portfolios by the number of windows
+num_windows = len(window_results)
+for profile in profile_volatility_limits.keys():
+    average_portfolios[profile]['weights'] /= num_windows
+    average_portfolios[profile]['returns'] /= num_windows
+    average_portfolios[profile]['risk'] /= num_windows
+
+# Display the best and average portfolios
+rows.append(["Best Portfolios"])
+for profile, portfolio in best_portfolios.items():
+    rows.append([f'Profile: {profile.capitalize()}'])
+    rows.append([f'{profile.capitalize()} Weights:'])
+    formatted_weights = format_weights_with_assets(portfolio['opt_weights'], data.columns[1:])
+    rows.extend([[asset, weight] for asset, weight in formatted_weights])
+    rows.append([f'{profile.capitalize()} Return:', f"{portfolio['opt_return']:.2%}"])
+    rows.append([f'{profile.capitalize()} Risk:', f"{portfolio['opt_risk']:.2%}"])
+    rows.append([])
+
+rows.append(["Average Portfolios"])
+for profile, avg in average_portfolios.items():
+    rows.append([f'Profile: {profile.capitalize()}'])
+    rows.append([f'{profile.capitalize()} Weights:'])
+    formatted_weights = format_weights_with_assets(avg['weights'], data.columns[1:])
+    rows.extend([[asset, weight] for asset, weight in formatted_weights])
+    rows.append([f'{profile.capitalize()} Average Return:', f"{avg['returns']:.2%}"])
+    rows.append([f'{profile.capitalize()} Average Risk:', f"{avg['risk']:.2%}"])
+    rows.append([])
+
+# Convert the rows to a DataFrame and save to CSV
+results_df = pd.DataFrame(rows)
+results_df.to_csv('C:/Users/T809650/VS Code/cholesky_enhanced.csv', index=False, header=False)
+
+print("Results have been saved to 'cholesky_enhanced.csv'.")
