@@ -1,0 +1,213 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+
+# Load the CSV file
+file_path = 'C:/Users/T809650/OneDrive - Santander Office 365/Área de Trabalho/Dados Para Python.csv'
+data = pd.read_csv(file_path, sep=';')
+
+# Display the exact column names to ensure they are parsed correctly
+print(f"Columns in the DataFrame: {list(data.columns)}")
+
+# Strip any leading or trailing whitespace from column names
+data.columns = data.columns.str.strip()
+
+# Check if 'Data' column needs conversion
+if 'Data' in data.columns:
+    if data['Data'].dtype == object:  # If 'Data' is a string
+        data['Data'] = data['Data'].str.replace(',', '').str.strip().astype(int)
+    else:
+        data['Data'] = data['Data'].astype(int)
+    print("Data column processed successfully.")
+else:
+    print("The 'Data' column was not found in the DataFrame.")
+
+# Convert the values to numeric (handling cases where they might be strings with percentages)
+for col in data.columns[1:]:
+    if data[col].dtype == object:  # Only apply string operations if the column is an object
+        data[col] = data[col].str.replace('%', '').astype(float) / 100
+    else:
+        data[col] = data[col].astype(float) / 100
+
+# Define the window parameters
+window_size = 756
+step_size = 63
+
+# Function to format weights as percentages with asset names
+def format_weights_with_assets(weights, asset_names):
+    return [(f"{asset}", f"{weight * 100:.2f}%") for asset, weight in zip(asset_names, weights)]
+
+# Function to calculate portfolio return and risk based on weights
+def portfolio_metrics(weights, returns, covariance):
+    portfolio_return = np.dot(weights, returns)
+    portfolio_risk = np.sqrt(np.dot(weights.T, np.dot(covariance, weights)))
+    return portfolio_return, portfolio_risk
+
+# Function to minimize (negative Sharpe ratio)
+def neg_sharpe_ratio(weights, returns, covariance):
+    portfolio_return, portfolio_risk = portfolio_metrics(weights, returns, covariance)
+    return -portfolio_return / portfolio_risk
+
+# Constraints: Weights must sum to 1 and no asset should have less than 1% allocation
+def allocation_constraints(weights):
+    return weights.sum() - 1
+
+# Function to create profile-specific bounds and set minimum allocations
+def create_profile_bounds(profile):
+    bounds = []
+    for asset in data.columns[1:]:
+        if profile == 'conservador' and asset in ['Ibovespa', 'S&P 500']:
+            bounds.append((0, 0))  # Force allocation to 0% for Ibovespa and S&P 500 in conservador profile
+        else:
+            bounds.append((0.01, 1))  # Minimum allocation of 1%, maximum 100%
+    return tuple(bounds)
+
+# Volatility constraints
+profile_volatility_limits = {
+    'conservador': 0.0127,
+    'moderado': 0.0370,
+    'balanceado': 0.0458,
+    'arrojado': 0.0629,
+    'agressivo': 0.0698
+}
+
+# Prepare lists to store results for each window
+rows = []
+portfolio_results = []  # Initialize to store portfolio results
+
+# Calculate metrics for each window
+for start in range(0, len(data) - window_size + 1, step_size):
+    end = start + window_size
+    window_data = data.iloc[start:end]
+
+    # Calculate returns for each asset class in this window
+    returns = (window_data.iloc[-1, 1:] / window_data.iloc[0, 1:]) - 1
+    
+    # Calculate volatility (standard deviation) for each asset class in this window
+    volatility = window_data.iloc[:, 1:].std()
+    
+    # Calculate the covariance matrix for the asset classes in this window
+    covariance = window_data.iloc[:, 1:].cov()
+
+    # Add the window start-end information as a header row
+    rows.append([f"Window Start: {start} - Window End: {end}"])
+
+    # Append the covariance matrix as a table under the window information
+    rows.append(["Covariance Matrix:"])
+    rows.append([''] + list(data.columns[1:]))  # Column headers
+    covariance_matrix = covariance.to_numpy()
+    for i, asset in enumerate(data.columns[1:]):
+        rows.append([asset] + covariance_matrix[i].tolist())
+    
+    # Store portfolio results for this window
+    window_portfolio_results = []
+
+    # Add profile-specific results under this header
+    for profile, max_volatility in profile_volatility_limits.items():
+        # Add a blank row before each profile
+        rows.append([])  
+
+        initial_weights = np.ones(len(returns)) / len(returns)
+        bounds = create_profile_bounds(profile)
+        constraints = [{'type': 'eq', 'fun': allocation_constraints},
+                       {'type': 'ineq', 'fun': lambda weights: max_volatility - portfolio_metrics(weights, returns, covariance)[1]}]
+
+        # Optimization
+        optimized = minimize(neg_sharpe_ratio, initial_weights, args=(returns, covariance), 
+                             method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        opt_return, opt_risk = portfolio_metrics(optimized.x, returns, covariance)
+        formatted_weights = format_weights_with_assets(optimized.x, data.columns[1:])
+        
+        # Show profile name, weights, then return and risk
+        rows.append([f'Profile: {profile.capitalize()}'])
+        rows.append([f'{profile.capitalize()} Weights:'])
+        rows.extend([[asset, weight] for asset, weight in formatted_weights])
+        rows.append([f'{profile.capitalize()} Return:', f"{opt_return:.2%}"])
+        rows.append([f'{profile.capitalize()} Risk:', f"{opt_risk:.2%}"])
+
+        # Store results for later analysis
+        window_portfolio_results.append({
+            'profile': profile,
+            'opt_return': opt_return,
+            'opt_risk': opt_risk,
+            'opt_weights': optimized.x,
+            'window_start': start,
+            'window_end': end
+        })
+    
+    portfolio_results.append({
+        'window_start': start,
+        'window_end': end,
+        'portfolios': window_portfolio_results
+    })
+
+    rows.append([])  # Add an empty row for better separation between windows
+
+# Section to calculate and display the top 5 portfolios and the average portfolio
+
+# Initialize dictionaries to track the best portfolios and average portfolios for each profile
+best_portfolios = {profile: {'return': -np.inf, 'risk': np.inf, 'weights': None, 'window': None} for profile in profile_volatility_limits.keys()}
+average_portfolios = {profile: {'return': [], 'risk': [], 'weights': []} for profile in profile_volatility_limits.keys()}
+
+# Iterate through each window to identify the best portfolios and accumulate data for the average portfolio
+for result in portfolio_results:
+    for portfolio in result['portfolios']:
+        profile = portfolio['profile']
+        ret = portfolio['opt_return']
+        risk = portfolio['opt_risk']
+        weights = portfolio['opt_weights']
+
+        # Update best portfolio if this one has a higher return and lower risk
+        if ret > best_portfolios[profile]['return'] and risk < best_portfolios[profile]['risk']:
+            best_portfolios[profile]['return'] = ret
+            best_portfolios[profile]['risk'] = risk
+            best_portfolios[profile]['weights'] = weights
+            best_portfolios[profile]['window'] = f"{portfolio['window_start']} - {portfolio['window_end']}"
+
+        # Append data to the average portfolios
+        average_portfolios[profile]['return'].append(ret)
+        average_portfolios[profile]['risk'].append(risk)
+        average_portfolios[profile]['weights'].append(weights)
+
+# Display top 5 portfolios based on highest return and lowest risk for each profile
+rows.append(["Top 5 Portfolios (Highest Return & Lowest Risk)"])
+
+for profile in profile_volatility_limits.keys():
+    best_return = best_portfolios[profile]['return']
+    best_risk = best_portfolios[profile]['risk']
+    best_weights = best_portfolios[profile]['weights']
+    best_window = best_portfolios[profile]['window']
+
+    if best_weights is not None:
+        rows.append([f'Best {profile.capitalize()} Portfolio (Window {best_window}):'])
+        rows.append([f'{profile.capitalize()} Weights:'])
+        asset_classes = data.columns[1:]
+        formatted_weights = format_weights_with_assets(best_weights, asset_classes)
+        rows.extend([[asset, weight] for asset, weight in formatted_weights])
+        rows.append([f'{profile.capitalize()} Return:', f"{best_return:.2%}"])
+        rows.append([f'{profile.capitalize()} Risk:', f"{best_risk:.2%}"])
+        rows.append([])  # Add an empty row for spacing
+
+# Calculate and display the average portfolio
+rows.append(["Average Portfolio for Each Profile"])
+
+for profile in profile_volatility_limits.keys():
+    avg_return = np.mean(average_portfolios[profile]['return'])
+    avg_risk = np.mean(average_portfolios[profile]['risk'])
+    avg_weights = np.mean(average_portfolios[profile]['weights'], axis=0)
+
+    rows.append([f'Average {profile.capitalize()} Portfolio:'])
+    rows.append([f'{profile.capitalize()} Weights:'])
+    asset_classes = data.columns[1:]
+    formatted_weights = format_weights_with_assets(avg_weights, asset_classes)
+    rows.extend([[asset, weight] for asset, weight in formatted_weights])
+    rows.append([f'{profile.capitalize()} Return:', f"{avg_return:.2%}"])
+    rows.append([f'{profile.capitalize()} Risk:', f"{avg_risk:.2%}"])
+    rows.append([])  # Add an empty row for spacing
+
+# Convert the rows to a DataFrame and save to CSV
+results_df = pd.DataFrame(rows)
+results_df.to_csv('C:/Users/T809650/VS Code/baseline_portfolio.csv', index=False, header=False)
+
+print("Results have been saved to 'baseline_portfolio.csv'.")
